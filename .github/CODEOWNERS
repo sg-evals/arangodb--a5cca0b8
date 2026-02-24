@@ -1,0 +1,15 @@
+# please check the following Github page for documentation:
+#   https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
+
+# `documentation-team` ownership
+/Documentation/ @arangodb/team-documentation
+/utils/*Documentation* @arangodb/team-documentation
+
+# `qa-team` ownership
+/Installation/ @arangodb/team-qa
+/scripts/ @arangodb/team-qa
+/etc/ @arangodb/team-qa
+/tests/test-definitions.txt @arangodb/team-qa
+
+# `team-frontend` ownership
+/js/apps/system/_admin/aardvark/APP/ @arangodb/team-frontend

@@ -1,0 +1,107 @@
+////////////////////////////////////////////////////////////////////////////////
+/// DISCLAIMER
+///
+/// Copyright 2014-2024 ArangoDB GmbH, Cologne, Germany
+/// Copyright 2004-2014 triAGENS GmbH, Cologne, Germany
+///
+/// Licensed under the Business Source License 1.1 (the "License");
+/// you may not use this file except in compliance with the License.
+/// You may obtain a copy of the License at
+///
+///     https://github.com/arangodb/arangodb/blob/devel/LICENSE
+///
+/// Unless required by applicable law or agreed to in writing, software
+/// distributed under the License is distributed on an "AS IS" BASIS,
+/// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+/// See the License for the specific language governing permissions and
+/// limitations under the License.
+///
+/// Copyright holder is ArangoDB GmbH, Cologne, Germany
+///
+/// @author Andreas Streichardt <andreas@arangodb.com>
+////////////////////////////////////////////////////////////////////////////////
+
+#pragma once
+
+#include "ApplicationFeatures/ApplicationFeature.h"
+#include "AuthenticationOptions.h"
+#include "Basics/Result.h"
+
+#include <atomic>
+#include <cstddef>
+#include <mutex>
+#include <string>
+#include <vector>
+
+namespace arangodb {
+namespace auth {
+class TokenCache;
+class UserManager;
+}  // namespace auth
+
+class AuthenticationFeature final
+    : public application_features::ApplicationFeature {
+ public:
+  static constexpr std::string_view name() noexcept { return "Authentication"; }
+
+  explicit AuthenticationFeature(
+      application_features::ApplicationServer& server);
+  ~AuthenticationFeature();
+
+  void collectOptions(std::shared_ptr<options::ProgramOptions>) override final;
+  void validateOptions(std::shared_ptr<options::ProgramOptions>) override final;
+  void prepare() override final;
+  void start() override final;
+  void stop() override final;
+  void unprepare() override final;
+
+  static AuthenticationFeature* instance() noexcept;
+
+  bool isActive() const noexcept;
+
+  bool authenticationUnixSockets() const noexcept;
+  bool authenticationSystemOnly() const noexcept;
+  std::string_view externalRBACservice() const noexcept;
+
+  /// @return Cache to deal with authentication tokens
+  auth::TokenCache& tokenCache() const noexcept;
+
+  /// @brief user manager may be null on DBServers and Agency
+  /// @return user manager singleton
+  auth::UserManager* userManager() const noexcept;
+
+  bool hasUserdefinedJwt() const;
+  /// verification only secrets (returns active secret, passive secrets,
+  /// isES256)
+  std::tuple<std::string, std::vector<std::string>, bool> jwtSecrets() const;
+
+  double sessionTimeout() const { return _options.sessionTimeout; }
+  double minimalJwtExpiryTime() const { return _options.minimalJwtExpiryTime; }
+  double maximalJwtExpiryTime() const { return _options.maximalJwtExpiryTime; }
+
+  // load secrets from file(s)
+  [[nodiscard]] Result loadJwtSecretsFromFile();
+
+#ifdef ARANGODB_USE_GOOGLE_TESTS
+  void setUserManager(std::unique_ptr<auth::UserManager>);
+#endif  // ARANGODB_USE_GOOGLE_TESTS
+
+ private:
+  /// load JWT secret from file specified at startup
+  [[nodiscard]] Result loadJwtSecretKeyfile();
+
+  /// load JWT secrets from folder
+  [[nodiscard]] Result loadJwtSecretFolder();
+
+  static constexpr size_t kMaxSecretLength = 64;
+
+  AuthenticationOptions _options;
+  std::unique_ptr<auth::UserManager> _userManager;
+  std::unique_ptr<auth::TokenCache> _authCache;
+
+  mutable std::mutex _jwtSecretsLock;
+
+  static std::atomic<AuthenticationFeature*> INSTANCE;
+};
+
+}  // namespace arangodb

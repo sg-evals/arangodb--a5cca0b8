@@ -1,0 +1,377 @@
+#!/usr/bin/env python3
+"""
+Generate CircleCI configuration from test definitions.
+
+This script reads test definition YAML files and generates a complete
+CircleCI configuration file with workflows for different architectures
+and build configurations.
+"""
+
+import sys
+import traceback
+from dataclasses import replace
+from typing import List
+import click
+
+from src.config_lib import (
+    TestDefinitionFile,
+    BuildVariant,
+    TestArguments,
+)
+from src.filters import FilterCriteria
+from src.output_generators.base import (
+    GeneratorConfig,
+    TestExecutionConfig,
+    CircleCIConfig,
+)
+from src.output_generators.circleci import CircleCIGenerator
+
+
+def parse_driver_branches(driver_branch_overrides: str) -> dict:
+    """
+    Parse driver-branch-overrides argument into a dictionary.
+
+    Args:
+        driver_branch_overrides: Colon-separated list like "main=branch1:driver=branch2"
+
+    Returns:
+        Dictionary mapping prefix to branch name
+
+    Raises:
+        ValueError: If the format is invalid
+    """
+    if not driver_branch_overrides:
+        return {}
+
+    result = {}
+    try:
+        for pair in driver_branch_overrides.split(":"):
+            if not pair:
+                continue
+            name, branch = pair.split("=")
+            result[name] = branch
+    except ValueError as ex:
+        raise ValueError(
+            f"Invalid --driver-branch-overrides format: '{pair}'. "
+            "Expected format: 'name=branch:name2=branch2'"
+        ) from ex
+
+    return result
+
+
+def apply_branch_overrides(
+    test_def: TestDefinitionFile, filename: str, branch_overrides: dict
+) -> TestDefinitionFile:
+    """
+    Apply git branch overrides to a test definition.
+
+    The --driver_branch_overrides feature allows overriding git branches for driver tests.
+    For example: --driver_branch_overrides go=feature-branch:js=main
+
+    When a test definition filename contains a key from branch_overrides (e.g., "go.yml"
+    contains "go"), the corresponding branch overrides the repository's default branch.
+
+    Args:
+        test_def: TestDefinitionFile to apply overrides to
+        filename: Filename to match against override keys
+        branch_overrides: Dictionary mapping filename prefix to branch override
+
+    Returns:
+        New TestDefinitionFile with branch overrides applied (immutable)
+    """
+    if not branch_overrides:
+        return test_def
+
+    # Extract base filename from path for matching
+    base_filename = filename.split("/")[-1] if "/" in filename else filename
+
+    # Find matching override (only apply first match)
+    override_branch = None
+    for prefix, branch in branch_overrides.items():
+        if prefix in base_filename:
+            override_branch = branch
+            break
+
+    if not override_branch:
+        return test_def  # No matching override
+
+    # Create new jobs dict with branch overrides applied
+    updated_jobs = {}
+    for job_name, job in test_def.jobs.items():
+        if job.repository:
+            # Create new job with overridden repository branch
+            updated_job = replace(
+                job, repository=replace(job.repository, git_branch=override_branch)
+            )
+            updated_jobs[job_name] = updated_job
+        else:
+            updated_jobs[job_name] = job
+
+    return TestDefinitionFile(jobs=updated_jobs)
+
+
+def load_test_definitions(
+    definition_files: List[str], test_branches: dict
+) -> List[TestDefinitionFile]:
+    """
+    Load test definition files with optional branch overrides.
+
+    Args:
+        definition_files: List of paths to test definition YAML files
+        test_branches: Dictionary mapping file prefix to branch override
+
+    Returns:
+        List of loaded TestDefinitionFile objects with branch overrides applied
+    """
+    test_defs = []
+
+    for filepath in definition_files:
+        # Add "tests/" prefix if path doesn't contain a directory separator
+        if "/" not in filepath:
+            filepath = f"tests/{filepath}"
+
+        # Load the test definition file
+        test_def = TestDefinitionFile.from_yaml_file(filepath)
+
+        # Apply branch overrides as separate step
+        test_def = apply_branch_overrides(test_def, filepath, test_branches)
+
+        test_defs.append(test_def)
+
+    return test_defs
+
+
+def create_generator_config(
+    tsan: bool,
+    alubsan: bool,
+    no_sanitizer: bool,
+    coverage: bool,
+    test_image: str,
+    arangosh_args: str,
+    extra_args: str,
+    arangod_without_v8: bool,
+    gtest: bool,
+    full: bool,
+    replication_two: bool,
+    create_docker_images: bool,
+    validate_only: bool,
+) -> GeneratorConfig:
+    """
+    Create GeneratorConfig from command line arguments.
+
+    Args:
+        All CLI parameters as individual arguments
+
+    Returns:
+        GeneratorConfig object
+    """
+    # Build list of requested build variants
+    build_variants = []
+
+    if no_sanitizer or (not tsan and not alubsan and not coverage):
+        # Include non-instrumented build if explicitly requested or no variants specified
+        build_variants.append(BuildVariant.NORMAL)
+    if tsan:
+        build_variants.append(BuildVariant.TSAN)
+    if alubsan:
+        build_variants.append(BuildVariant.ALUBSAN)
+    if coverage:
+        build_variants.append(BuildVariant.COVERAGE)
+
+    assert build_variants, "build_variants must not be empty (logic error)"
+
+    # Create filter criteria
+    filter_criteria = FilterCriteria(
+        gtest=gtest,
+        full=full,
+        v8=not arangod_without_v8,
+    )
+
+    # Create test execution config
+    arangosh_args_list = TestArguments.parse_args_string(arangosh_args or "")
+    extra_args_list = TestArguments.parse_args_string(
+        extra_args or "",
+        add_skip_server_js=arangod_without_v8,
+    )
+
+    test_execution = TestExecutionConfig(
+        arangosh_args=arangosh_args_list,
+        extra_args=extra_args_list,
+        replication_two=replication_two,
+    )
+
+    # Create CircleCI-specific config
+    circleci_config = CircleCIConfig(
+        create_docker_images=create_docker_images,
+        test_image=test_image,
+    )
+
+    return GeneratorConfig(
+        filter_criteria=filter_criteria,
+        test_execution=test_execution,
+        circleci=circleci_config,
+        validate_only=validate_only,
+        build_variants=build_variants,
+    )
+
+
+@click.command()
+@click.argument("base_config", type=click.Path(exists=True))
+@click.argument("definitions", nargs=-1, required=False)
+@click.option(
+    "-o",
+    "--output",
+    required=True,
+    type=click.Path(),
+    help="Output filename for generated config",
+)
+@click.option(
+    "--tsan",
+    is_flag=True,
+    help="Enable Thread Sanitizer (TSAN)",
+)
+@click.option(
+    "--alubsan",
+    is_flag=True,
+    help="Enable Address+Leak+UndefinedBehavior Sanitizer (ALUBSAN)",
+)
+@click.option(
+    "--no-sanitizer",
+    is_flag=True,
+    help="Enable non-sanitizer build (can be combined with --tsan/--alubsan/--coverage)",
+)
+@click.option(
+    "--coverage",
+    is_flag=True,
+    help="Enable coverage build",
+)
+@click.option(
+    "-t",
+    "--test-image",
+    required=True,
+    help="Test image to be used",
+)
+@click.option(
+    "-b",
+    "--driver-branch-overrides",
+    help="Colon-separated list of driver=branch (e.g., 'go=feature:java=main')",
+)
+@click.option(
+    "--arangosh-args",
+    help="Additional arguments to append to arangosh",
+)
+@click.option(
+    "--extra-args",
+    help="Additional arguments to append to testing.js",
+)
+@click.option(
+    "--arangod-without-v8",
+    is_flag=True,
+    help="Run without JavaScript (V8 disabled)",
+)
+@click.option(
+    "--gtest",
+    is_flag=True,
+    help="Only run gtest tests",
+)
+@click.option(
+    "--full",
+    is_flag=True,
+    help="Include full test set",
+)
+@click.option(
+    "-rt",
+    "--replication-two",
+    is_flag=True,
+    help="Enable replication version 2 tests",
+)
+@click.option(
+    "--create-docker-images",
+    is_flag=True,
+    help="Create docker images from build results",
+)
+@click.option(
+    "--validate-only",
+    is_flag=True,
+    help="Validate test definitions without generating config",
+)
+def main(
+    base_config: str,
+    definitions: tuple,
+    output: str,
+    tsan: bool,
+    alubsan: bool,
+    no_sanitizer: bool,
+    coverage: bool,
+    test_image: str,
+    driver_branch_overrides: str,
+    arangosh_args: str,
+    extra_args: str,
+    arangod_without_v8: bool,
+    gtest: bool,
+    full: bool,
+    replication_two: bool,
+    create_docker_images: bool,
+    validate_only: bool,
+):
+    """
+    Generate CircleCI configuration from test definitions.
+
+    BASE_CONFIG is the path to base CircleCI config YAML file.
+    DEFINITIONS are test definition YAML file(s).
+    """
+    try:
+        driver_branches_dict = parse_driver_branches(driver_branch_overrides or "")
+
+        # Load test definitions
+        definition_list = list(definitions)
+        if definition_list:
+            click.echo(f"Loading {len(definition_list)} test definition file(s)...")
+            test_defs = load_test_definitions(definition_list, driver_branches_dict)
+        else:
+            test_defs = []
+
+        # Create generator config
+        config = create_generator_config(
+            tsan=tsan,
+            alubsan=alubsan,
+            no_sanitizer=no_sanitizer,
+            coverage=coverage,
+            test_image=test_image,
+            arangosh_args=arangosh_args,
+            extra_args=extra_args,
+            arangod_without_v8=arangod_without_v8,
+            gtest=gtest,
+            full=full,
+            replication_two=replication_two,
+            create_docker_images=create_docker_images,
+            validate_only=validate_only,
+        )
+
+        # If validate-only, we're done
+        if validate_only:
+            click.echo("Validation successful!")
+            sys.exit(0)
+
+        # Create generator
+        generator = CircleCIGenerator(config, base_config_path=base_config)
+
+        # Generate configuration
+        click.echo("Generating CircleCI configuration...")
+        circleci_config = generator.generate(test_defs)
+
+        # Write output
+        click.echo(f"Writing to {output}...")
+        generator.write_output(circleci_config, output)
+
+        click.echo("Done!")
+        sys.exit(0)
+
+    except Exception as exc:
+        click.echo(f"Error: {exc}", err=True)
+        traceback.print_exc(file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()  # pylint: disable=no-value-for-parameter
